@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-"""Nibbles - a Python/pygame port of QBasic NIBBLES.BAS (Microsoft, 1990).
+"""Nibbles - Enhanced Edition.
 
-Original logic, level layouts and scoring are preserved.  Additions over the
-original BASIC version:
+A modern re-imagination of the 1990 QBasic NIBBLES.BAS game.  The original
+grid (80x50), the ten maze layouts, the scoring curve (1..9), the lives
+counter and the two-player head-to-head are preserved faithfully.
 
-    * Frame-rate independent movement (no busy-wait loop).
-    * Smooth pygame rendering with a pseudo-CGA palette.
-    * Procedurally generated sound effects (eat / die / level-up / menu).
-    * Persistent high-score table stored in ~/.nibbles_scores.json.
-    * Polished menu and game-over screens with keyboard navigation.
-    * Pause overlay, countdown before each life, and per-level speed-up.
+What's layered on top:
+    * Nine hand-drawn food sprites in place of the giant numeric digits.
+    * Snake with gradient body, animated eyes that track the direction,
+      and a subtle trail of particles.
+    * 3D-ish beveled walls, radial-vignette background, grid overlay.
+    * Particle system for eating, dying and level-ups.
+    * Screen shake on crash, white flash + fanfare on level up.
+    * HUD with heart lives, upcoming-item preview, combo multiplier.
+    * Procedural audio: distinct tone per fruit, death arpeggio,
+      victory chime, soft menu melody.
+    * Persistent high scores at ~/.nibbles_scores.json.
 
 Controls
     Player 1 .... Arrow keys
@@ -28,9 +34,8 @@ import random
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
-# pygame is noisy on import; silence the welcome banner.
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 import pygame  # noqa: E402
 
@@ -38,10 +43,10 @@ import pygame  # noqa: E402
 # Configuration                                                               #
 # --------------------------------------------------------------------------- #
 
-GRID_COLS = 80                         # 1-indexed: cols 1..80
-GRID_ROWS = 50                         # 1-indexed: rows 1..50
-CELL = 12                              # pixel size of a grid cell
-HUD_H = 40                             # top status bar in pixels
+GRID_COLS = 80
+GRID_ROWS = 50
+CELL = 14
+HUD_H = 52
 SCREEN_W = GRID_COLS * CELL
 SCREEN_H = GRID_ROWS * CELL + HUD_H
 FPS = 60
@@ -50,33 +55,42 @@ MAX_LEN = 1000
 HISCORE_FILE = Path.home() / ".nibbles_scores.json"
 HISCORE_LIMIT = 10
 
-# Direction encoding matches the BASIC original (1=up, 2=down, 3=left, 4=right)
 DIRS = {1: (-1, 0), 2: (1, 0), 3: (0, -1), 4: (0, 1)}
 OPP = {1: 2, 2: 1, 3: 4, 4: 3}
 
-# Colours (R, G, B) -- a saturated, slightly modernised CGA palette.
-BG_COL = (12, 14, 64)
-GRID_COL = (18, 22, 80)
-WALL_COL = (220, 70, 70)
-WALL_HI = (255, 140, 140)
+# Palette
+BG_DEEP = (6, 8, 36)
+BG_MID = (12, 14, 60)
+BG_SOFT = (24, 26, 86)
+GRID_COL = (24, 28, 92)
+WALL_FILL = (190, 46, 70)
+WALL_HI = (255, 150, 150)
+WALL_LO = (90, 10, 24)
 NUM_COL = (255, 240, 120)
 HUD_BG = (0, 0, 0)
 HUD_FG = (240, 240, 240)
-DIALOG_BG = (140, 0, 0)
+DIALOG_BG = (24, 10, 48)
+DIALOG_BORDER = (255, 220, 140)
 DIALOG_FG = (255, 255, 255)
-SAMMY_COL = (255, 215, 60)
-SAMMY_HEAD = (255, 255, 170)
-JAKE_COL = (240, 90, 200)
-JAKE_HEAD = (255, 180, 240)
-WHITE = (250, 250, 250)
-GREY = (150, 150, 150)
-DIM = (90, 90, 110)
+HEART_COL = (240, 70, 90)
+HEART_SHINE = (255, 180, 180)
 
-# Cell-content tags used in the playfield grid.
-EMPTY, WALL, NUMBER = "empty", "wall", "number"
+SAMMY_DARK = (140, 110, 20)
+SAMMY_LIGHT = (255, 220, 70)
+SAMMY_HEAD = (255, 245, 150)
+
+JAKE_DARK = (120, 30, 110)
+JAKE_LIGHT = (240, 100, 210)
+JAKE_HEAD = (255, 180, 240)
+
+WHITE = (250, 250, 250)
+GREY = (170, 170, 180)
+DIM = (110, 110, 140)
+
+EMPTY, WALL = "empty", "wall"
 
 # --------------------------------------------------------------------------- #
-# Sound: tiny PCM tone generator so we ship no audio assets                   #
+# Audio                                                                       #
 # --------------------------------------------------------------------------- #
 
 SAMPLE_RATE = 22050
@@ -94,8 +108,8 @@ def _init_audio() -> None:
         _mixer_ok = False
 
 
-def _make_tone(freq: float, duration_ms: int, volume: float = 0.35,
-               wave: str = "square") -> Optional[pygame.mixer.Sound]:
+def _tone(freq: float, duration_ms: int, volume: float = 0.3,
+          wave: str = "square") -> Optional[pygame.mixer.Sound]:
     if not _mixer_ok:
         return None
     key = (round(freq, 2), duration_ms, round(volume, 2), wave)
@@ -107,14 +121,16 @@ def _make_tone(freq: float, duration_ms: int, volume: float = 0.35,
     buf = array.array("h")
     amp = int(32767 * volume)
     attack = max(1, int(SAMPLE_RATE * 0.005))
-    release = max(1, int(SAMPLE_RATE * 0.04))
+    release = max(1, int(SAMPLE_RATE * 0.05))
     for i in range(n):
         t = i / SAMPLE_RATE
         if wave == "square":
             v = amp if math.sin(2 * math.pi * freq * t) >= 0 else -amp
+        elif wave == "triangle":
+            x = (freq * t) % 1
+            v = int(amp * (4 * abs(x - 0.5) - 1))
         else:
             v = int(amp * math.sin(2 * math.pi * freq * t))
-        # Simple ADSR-ish envelope to avoid clicks.
         if i < attack:
             v = int(v * (i / attack))
         elif i > n - release:
@@ -126,8 +142,13 @@ def _make_tone(freq: float, duration_ms: int, volume: float = 0.35,
     return snd
 
 
-def play_eat() -> None:
-    s = _make_tone(880, 60)
+# Distinct eating tones per food value
+EAT_FREQS = (523, 587, 659, 698, 784, 880, 988, 1046, 1318)
+
+
+def play_eat(value: int) -> None:
+    f = EAT_FREQS[max(1, min(9, value)) - 1]
+    s = _tone(f, 70, 0.25, "triangle")
     if s:
         s.play()
 
@@ -135,8 +156,8 @@ def play_eat() -> None:
 def play_die() -> None:
     if not _mixer_ok:
         return
-    for f, d in ((440, 80), (330, 80), (220, 120), (165, 200)):
-        snd = _make_tone(f, d, 0.4)
+    for f, d in ((440, 90), (330, 90), (247, 120), (175, 220)):
+        snd = _tone(f, d, 0.35)
         if snd:
             snd.play()
             pygame.time.delay(d)
@@ -145,29 +166,392 @@ def play_die() -> None:
 def play_levelup() -> None:
     if not _mixer_ok:
         return
-    for f in (523, 659, 784, 1046):
-        snd = _make_tone(f, 90, 0.4)
+    for f in (523, 659, 784, 1046, 1319):
+        snd = _tone(f, 80, 0.35, "triangle")
         if snd:
             snd.play()
-            pygame.time.delay(90)
+            pygame.time.delay(80)
 
 
 def play_blip() -> None:
-    s = _make_tone(660, 40, 0.25)
+    s = _tone(660, 30, 0.2, "triangle")
     if s:
         s.play()
 
 
+def play_menu_chord() -> None:
+    if not _mixer_ok:
+        return
+    # Short arpeggio when entering a menu
+    for f in (523, 659, 784):
+        s = _tone(f, 110, 0.25, "triangle")
+        if s:
+            s.play()
+            pygame.time.delay(110)
+
+
 # --------------------------------------------------------------------------- #
-# Game data                                                                   #
+# Food sprites: hand-drawn with pygame primitives                             #
+# --------------------------------------------------------------------------- #
+
+FOOD_NAMES = [
+    "Apple", "Cherries", "Orange", "Banana", "Grapes",
+    "Strawberry", "Watermelon", "Pineapple", "Golden Star",
+]
+
+
+def _soft_shadow(surface: pygame.Surface, cx: int, cy: int, radius: int) -> None:
+    shadow = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
+    for r in range(radius, 0, -1):
+        alpha = int(70 * (r / radius) ** 2)
+        pygame.draw.circle(shadow, (0, 0, 0, 90 - alpha),
+                           (radius, radius), r)
+    surface.blit(shadow, (cx - radius, cy - radius))
+
+
+def _draw_apple(s: pygame.Surface, sz: int) -> None:
+    cx, cy = sz // 2, sz // 2 + 1
+    r = int(sz * 0.33)
+    _soft_shadow(s, cx, cy + r - 2, r)
+    pygame.draw.circle(s, (170, 20, 20), (cx + 2, cy + 1), r)
+    pygame.draw.circle(s, (235, 50, 50), (cx - 1, cy), r)
+    pygame.draw.circle(s, (255, 150, 150), (cx - r // 2, cy - r // 2),
+                       max(2, r // 3))
+    # Leaf
+    leaf = pygame.Surface((sz // 3, sz // 5), pygame.SRCALPHA)
+    pygame.draw.ellipse(leaf, (60, 180, 70), leaf.get_rect())
+    pygame.draw.ellipse(leaf, (100, 220, 100), leaf.get_rect().inflate(-2, -2))
+    leaf = pygame.transform.rotate(leaf, 35)
+    s.blit(leaf, (cx, cy - r - 3))
+    # Stem
+    pygame.draw.line(s, (80, 50, 20), (cx, cy - r),
+                     (cx + 1, cy - r - 4), 2)
+
+
+def _draw_cherries(s: pygame.Surface, sz: int) -> None:
+    r = int(sz * 0.23)
+    cy = int(sz * 0.65)
+    for off, cshade in ((-r, (200, 20, 30)), (r + 1, (235, 45, 60))):
+        cx = sz // 2 + off
+        _soft_shadow(s, cx, cy + r - 2, r)
+        pygame.draw.circle(s, (120, 10, 15), (cx + 1, cy + 1), r)
+        pygame.draw.circle(s, cshade, (cx, cy), r)
+        pygame.draw.circle(s, (255, 170, 170),
+                           (cx - r // 2, cy - r // 2), max(1, r // 4))
+    # Stems meeting at the top
+    top = (sz // 2, int(sz * 0.15))
+    pygame.draw.line(s, (90, 150, 40), (sz // 2 - r, cy - r), top, 2)
+    pygame.draw.line(s, (90, 150, 40), (sz // 2 + r + 1, cy - r), top, 2)
+    # Little leaf
+    leaf = pygame.Surface((sz // 3, sz // 6), pygame.SRCALPHA)
+    pygame.draw.ellipse(leaf, (70, 180, 70), leaf.get_rect())
+    s.blit(leaf, (top[0] - 1, top[1] - 2))
+
+
+def _draw_orange(s: pygame.Surface, sz: int) -> None:
+    cx, cy = sz // 2, sz // 2 + 1
+    r = int(sz * 0.35)
+    _soft_shadow(s, cx, cy + r - 2, r)
+    pygame.draw.circle(s, (190, 100, 10), (cx + 1, cy + 1), r)
+    pygame.draw.circle(s, (255, 150, 40), (cx, cy), r)
+    # Texture dots
+    for _ in range(10):
+        tx = cx + random.randint(-r + 2, r - 2)
+        ty = cy + random.randint(-r + 2, r - 2)
+        if (tx - cx) ** 2 + (ty - cy) ** 2 < (r - 2) ** 2:
+            pygame.draw.circle(s, (230, 120, 20), (tx, ty), 1)
+    pygame.draw.circle(s, (255, 220, 180),
+                       (cx - r // 2, cy - r // 2), max(2, r // 3))
+    # Leaf
+    pygame.draw.polygon(s, (60, 170, 70),
+                        [(cx, cy - r + 1), (cx + 4, cy - r - 2),
+                         (cx - 2, cy - r - 2)])
+
+
+def _draw_banana(s: pygame.Surface, sz: int) -> None:
+    # Flattened ellipse rotated to taste - that's a convincing banana.
+    ell = pygame.Surface((int(sz * 0.9), int(sz * 0.42)), pygame.SRCALPHA)
+    pygame.draw.ellipse(ell, (170, 115, 10), ell.get_rect().move(1, 2))
+    pygame.draw.ellipse(ell, (255, 215, 50), ell.get_rect())
+    hi = ell.get_rect().inflate(-6, -ell.get_height() // 2 - 2)
+    hi.y = 2
+    pygame.draw.ellipse(ell, (255, 240, 140), hi)
+    rotated = pygame.transform.rotate(ell, -30)
+    s.blit(rotated, rotated.get_rect(center=(sz // 2, sz // 2)))
+    pygame.draw.circle(s, (90, 60, 20),
+                       (sz // 2 - int(sz * 0.33), int(sz * 0.68)), 2)
+    pygame.draw.circle(s, (90, 60, 20),
+                       (sz // 2 + int(sz * 0.33), int(sz * 0.32)), 2)
+
+
+def _draw_grapes(s: pygame.Surface, sz: int) -> None:
+    r = max(2, int(sz * 0.12))
+    centres = [
+        (0.5, 0.28), (0.35, 0.42), (0.65, 0.42),
+        (0.25, 0.56), (0.5, 0.56), (0.75, 0.56),
+        (0.37, 0.72), (0.63, 0.72), (0.5, 0.86),
+    ]
+    for fx, fy in centres:
+        cx = int(sz * fx)
+        cy = int(sz * fy)
+        pygame.draw.circle(s, (60, 20, 90), (cx + 1, cy + 1), r)
+        pygame.draw.circle(s, (150, 60, 200), (cx, cy), r)
+        pygame.draw.circle(s, (210, 160, 240),
+                           (cx - r // 2, cy - r // 2), max(1, r // 3))
+    # Leaf
+    pygame.draw.polygon(s, (70, 170, 70),
+                        [(sz // 2 - 4, 4), (sz // 2 + 4, 4),
+                         (sz // 2 + 6, int(sz * 0.22)),
+                         (sz // 2 - 6, int(sz * 0.22))])
+
+
+def _draw_strawberry(s: pygame.Surface, sz: int) -> None:
+    # Rounded triangle body
+    pts = [(sz // 2, int(sz * 0.95)),
+           (int(sz * 0.1), int(sz * 0.45)),
+           (int(sz * 0.9), int(sz * 0.45))]
+    _soft_shadow(s, sz // 2 + 1, int(sz * 0.75), sz // 3)
+    pygame.draw.polygon(s, (220, 30, 50), pts)
+    # Soften corners
+    pygame.draw.circle(s, (220, 30, 50), (int(sz * 0.1), int(sz * 0.45)), 5)
+    pygame.draw.circle(s, (220, 30, 50), (int(sz * 0.9), int(sz * 0.45)), 5)
+    pygame.draw.circle(s, (220, 30, 50), (sz // 2, int(sz * 0.95)), 4)
+    # Highlight
+    pygame.draw.circle(s, (255, 170, 170),
+                       (int(sz * 0.35), int(sz * 0.55)), 3)
+    # Seeds
+    for fx, fy in [(0.3, 0.6), (0.5, 0.55), (0.68, 0.6),
+                   (0.4, 0.72), (0.6, 0.72), (0.5, 0.85)]:
+        pygame.draw.circle(s, (255, 240, 120),
+                           (int(sz * fx), int(sz * fy)), 1)
+    # Calyx
+    for angle in (-30, 0, 30):
+        tip = (sz // 2 + int(math.sin(math.radians(angle)) * sz * 0.3),
+               int(sz * 0.45) - int(math.cos(math.radians(angle)) * sz * 0.18))
+        pygame.draw.polygon(s, (60, 170, 70),
+                            [(sz // 2, int(sz * 0.45)), tip,
+                             (sz // 2 + 2, int(sz * 0.45) - 2)])
+
+
+def _draw_watermelon(s: pygame.Surface, sz: int) -> None:
+    # Draw a full ellipse but clip the top half away for a slice look.
+    rect = pygame.Rect(2, int(sz * 0.1), sz - 4, int(sz * 0.8))
+    clip = pygame.Rect(0, int(sz * 0.3), sz, sz)
+    s.set_clip(clip)
+    pygame.draw.ellipse(s, (30, 90, 40), rect.move(1, 1))
+    pygame.draw.ellipse(s, (60, 160, 50), rect)
+    pygame.draw.ellipse(s, (170, 230, 140), rect.inflate(-4, -4))
+    pygame.draw.ellipse(s, (240, 90, 110), rect.inflate(-10, -10))
+    s.set_clip(None)
+    pygame.draw.line(s, (30, 90, 40),
+                     (2, int(sz * 0.3) + 1),
+                     (sz - 3, int(sz * 0.3) + 1), 2)
+    pygame.draw.line(s, (170, 230, 140),
+                     (6, int(sz * 0.3) + 3),
+                     (sz - 7, int(sz * 0.3) + 3), 1)
+    for fx, fy in [(0.3, 0.55), (0.5, 0.5), (0.7, 0.55),
+                   (0.4, 0.72), (0.6, 0.72)]:
+        pygame.draw.ellipse(s, (30, 20, 20),
+                            (int(sz * fx) - 1, int(sz * fy), 2, 3))
+
+
+def _draw_pineapple(s: pygame.Surface, sz: int) -> None:
+    body = pygame.Rect(int(sz * 0.22), int(sz * 0.3),
+                       int(sz * 0.56), int(sz * 0.6))
+    _soft_shadow(s, sz // 2, int(sz * 0.85), sz // 3)
+    pygame.draw.ellipse(s, (190, 130, 10), body.move(1, 1))
+    pygame.draw.ellipse(s, (240, 190, 50), body)
+    # Diamond pattern
+    for i in range(3):
+        y = body.top + 6 + i * 6
+        for j in range(3):
+            x = body.left + 5 + j * 7
+            pygame.draw.polygon(s, (160, 100, 10),
+                                [(x, y - 2), (x + 3, y),
+                                 (x, y + 2), (x - 3, y)])
+    # Crown
+    for off in (-6, -2, 2, 6):
+        pygame.draw.polygon(s, (60, 160, 60),
+                            [(sz // 2 + off, int(sz * 0.3)),
+                             (sz // 2 + off - 2, int(sz * 0.1)),
+                             (sz // 2 + off + 2, int(sz * 0.1))])
+    pygame.draw.polygon(s, (100, 200, 100),
+                        [(sz // 2, int(sz * 0.3) - 2),
+                         (sz // 2 - 3, int(sz * 0.05)),
+                         (sz // 2 + 3, int(sz * 0.05))])
+
+
+def _draw_star(s: pygame.Surface, sz: int) -> None:
+    cx, cy = sz // 2, sz // 2
+    outer = sz * 0.42
+    inner = sz * 0.18
+    pts = []
+    for i in range(10):
+        angle = -math.pi / 2 + math.pi * i / 5
+        r = outer if i % 2 == 0 else inner
+        pts.append((cx + math.cos(angle) * r,
+                    cy + math.sin(angle) * r))
+    # Glow
+    glow = pygame.Surface((sz, sz), pygame.SRCALPHA)
+    for g in range(6, 0, -1):
+        alpha = 25
+        exp = [(cx + (p[0] - cx) * (1 + g * 0.08),
+                cy + (p[1] - cy) * (1 + g * 0.08)) for p in pts]
+        pygame.draw.polygon(glow, (255, 220, 60, alpha), exp)
+    s.blit(glow, (0, 0))
+    pygame.draw.polygon(s, (200, 150, 20), [(x + 1, y + 1) for x, y in pts])
+    pygame.draw.polygon(s, (255, 230, 80), pts)
+    pygame.draw.polygon(s, (255, 250, 180),
+                        [(cx + (p[0] - cx) * 0.5,
+                          cy + (p[1] - cy) * 0.5) for p in pts])
+
+
+_FOOD_DRAWERS: List[Callable[[pygame.Surface, int], None]] = [
+    _draw_apple, _draw_cherries, _draw_orange, _draw_banana,
+    _draw_grapes, _draw_strawberry, _draw_watermelon,
+    _draw_pineapple, _draw_star,
+]
+
+
+def build_food_sprites() -> List[pygame.Surface]:
+    sz = int(CELL * 2.4)
+    sprites: List[pygame.Surface] = []
+    for drawer in _FOOD_DRAWERS:
+        surf = pygame.Surface((sz, sz), pygame.SRCALPHA)
+        drawer(surf, sz)
+        sprites.append(surf)
+    return sprites
+
+
+def build_food_icon(sprite: pygame.Surface, size: int) -> pygame.Surface:
+    return pygame.transform.smoothscale(sprite, (size, size))
+
+
+# --------------------------------------------------------------------------- #
+# Wall & background tiles                                                     #
+# --------------------------------------------------------------------------- #
+
+
+def build_wall_tile() -> pygame.Surface:
+    s = pygame.Surface((CELL, CELL), pygame.SRCALPHA)
+    pygame.draw.rect(s, WALL_FILL, (0, 0, CELL, CELL))
+    # Bevel: light on top-left, dark on bottom-right
+    pygame.draw.line(s, WALL_HI, (0, 0), (CELL - 1, 0), 2)
+    pygame.draw.line(s, WALL_HI, (0, 0), (0, CELL - 1), 2)
+    pygame.draw.line(s, WALL_LO, (CELL - 1, 1), (CELL - 1, CELL - 1), 2)
+    pygame.draw.line(s, WALL_LO, (1, CELL - 1), (CELL - 1, CELL - 1), 2)
+    # Rivets
+    pygame.draw.circle(s, WALL_HI, (CELL // 2, CELL // 2), 1)
+    return s
+
+
+def build_background() -> pygame.Surface:
+    """Pre-render the parallax starfield + vignette."""
+    s = pygame.Surface((SCREEN_W, SCREEN_H - HUD_H))
+    # Vertical gradient
+    for y in range(SCREEN_H - HUD_H):
+        t = y / (SCREEN_H - HUD_H)
+        r = int(BG_DEEP[0] * (1 - t) + BG_MID[0] * t)
+        g = int(BG_DEEP[1] * (1 - t) + BG_MID[1] * t)
+        b = int(BG_DEEP[2] * (1 - t) + BG_MID[2] * t)
+        pygame.draw.line(s, (r, g, b), (0, y), (SCREEN_W, y))
+    # Scatter stars
+    rng = random.Random(1337)
+    for _ in range(240):
+        x = rng.randint(0, SCREEN_W - 1)
+        y = rng.randint(0, SCREEN_H - HUD_H - 1)
+        br = rng.choice((60, 90, 140, 200))
+        s.set_at((x, y), (br, br, min(255, br + 30)))
+    # A few brighter sparkles
+    for _ in range(28):
+        x = rng.randint(2, SCREEN_W - 3)
+        y = rng.randint(2, SCREEN_H - HUD_H - 3)
+        pygame.draw.circle(s, (220, 220, 255), (x, y), 1)
+    # Vignette
+    vign = pygame.Surface((SCREEN_W, SCREEN_H - HUD_H), pygame.SRCALPHA)
+    cx, cy = SCREEN_W // 2, (SCREEN_H - HUD_H) // 2
+    max_d = int(math.hypot(cx, cy))
+    for ring in range(6):
+        alpha = 18
+        r = int(max_d * (0.7 + ring * 0.07))
+        pygame.draw.circle(vign, (0, 0, 0, alpha),
+                           (cx, cy), r, width=max(1, max_d // 10))
+    s.blit(vign, (0, 0))
+    return s
+
+
+# --------------------------------------------------------------------------- #
+# Particles                                                                   #
+# --------------------------------------------------------------------------- #
+
+
+class ParticleSystem:
+    """A tiny CPU-side particle system - enough to garnish feedback events."""
+
+    def __init__(self) -> None:
+        self.parts: List[List[float]] = []
+
+    def emit(self, x: float, y: float, color: Tuple[int, int, int],
+             count: int = 14, speed: float = 160.0,
+             life: float = 0.55, size: int = 3,
+             gravity: float = 220.0, spread: float = math.tau) -> None:
+        for _ in range(count):
+            ang = random.random() * spread
+            spd = random.uniform(speed * 0.4, speed)
+            self.parts.append([
+                x, y,
+                math.cos(ang) * spd, math.sin(ang) * spd,
+                life, life,
+                color[0], color[1], color[2],
+                size, gravity,
+            ])
+
+    def spark(self, x: float, y: float, color: Tuple[int, int, int]) -> None:
+        self.emit(x, y, color, count=18, speed=180, life=0.5,
+                  size=3, gravity=200)
+
+    def burst(self, x: float, y: float, color: Tuple[int, int, int]) -> None:
+        self.emit(x, y, color, count=40, speed=260, life=0.9,
+                  size=4, gravity=180)
+
+    def trail(self, x: float, y: float, color: Tuple[int, int, int]) -> None:
+        self.emit(x, y, color, count=1, speed=20, life=0.3,
+                  size=2, gravity=10)
+
+    def update(self, dt: float) -> None:
+        kept: List[List[float]] = []
+        for p in self.parts:
+            p[0] += p[2] * dt
+            p[1] += p[3] * dt
+            p[3] += p[10] * dt
+            p[4] -= dt
+            if p[4] > 0:
+                kept.append(p)
+        self.parts = kept
+
+    def draw(self, surface: pygame.Surface) -> None:
+        for p in self.parts:
+            life_frac = max(0.0, p[4] / p[5])
+            alpha = int(255 * life_frac)
+            size = max(1, int(p[9] * (0.4 + 0.6 * life_frac)))
+            tmp = pygame.Surface((size * 2, size * 2), pygame.SRCALPHA)
+            pygame.draw.circle(tmp,
+                               (int(p[6]), int(p[7]), int(p[8]), alpha),
+                               (size, size), size)
+            surface.blit(tmp, (p[0] - size, p[1] - size))
+
+
+# --------------------------------------------------------------------------- #
+# Snake entity                                                                #
 # --------------------------------------------------------------------------- #
 
 
 @dataclass
 class Snake:
     name: str
-    body_color: Tuple[int, int, int]
-    head_color: Tuple[int, int, int]
+    dark: Tuple[int, int, int]
+    light: Tuple[int, int, int]
+    head_col: Tuple[int, int, int]
     body: List[Tuple[int, int]] = field(default_factory=list)
     direction: int = 4
     pending: int = 4
@@ -175,6 +559,8 @@ class Snake:
     score: int = 0
     lives: int = 5
     alive: bool = True
+    combo: int = 0
+    combo_timer: float = 0.0
 
     @property
     def head(self) -> Tuple[int, int]:
@@ -186,16 +572,73 @@ class Snake:
         self.pending = direction
         self.target_length = 2
         self.alive = True
+        self.combo = 0
+        self.combo_timer = 0.0
+
+
+def _lerp(a: Tuple[int, int, int], b: Tuple[int, int, int],
+          t: float) -> Tuple[int, int, int]:
+    return (int(a[0] + (b[0] - a[0]) * t),
+            int(a[1] + (b[1] - a[1]) * t),
+            int(a[2] + (b[2] - a[2]) * t))
+
+
+def draw_snake(surface: pygame.Surface, snake: Snake, time_s: float) -> None:
+    if not snake.body:
+        return
+    n = len(snake.body)
+    for i, (r, c) in enumerate(snake.body):
+        t = i / max(1, n - 1)
+        col = _lerp(snake.dark, snake.light, 0.3 + 0.7 * t)
+        rect = cell_rect(r, c).inflate(-1, -1)
+        pygame.draw.rect(surface, col, rect, border_radius=4)
+    # Head overlay + eyes
+    hr, hc = snake.head
+    head_rect = cell_rect(hr, hc)
+    pygame.draw.rect(surface, snake.head_col,
+                     head_rect.inflate(1, 1), border_radius=5)
+    pygame.draw.rect(surface, (20, 20, 30),
+                     head_rect.inflate(1, 1), 1, border_radius=5)
+
+    # Eyes
+    dr, dc = DIRS[snake.direction]
+    cx = head_rect.centerx
+    cy = head_rect.centery
+    # Perpendicular offset for the two eyes
+    px, py = -dc, dr
+    eye_off = max(2, CELL // 4)
+    eye_r = max(2, CELL // 5)
+    for sign in (-1, 1):
+        ex = cx + px * sign * eye_off
+        ey = cy + py * sign * eye_off
+        pygame.draw.circle(surface, (240, 240, 250), (ex, ey), eye_r)
+        # Pupil shifted toward moving direction
+        pupil_shift = max(1, eye_r // 2)
+        pygame.draw.circle(surface, (20, 20, 40),
+                           (ex + dc * pupil_shift,
+                            ey + dr * pupil_shift),
+                           max(1, eye_r - 2))
+
+    # Tongue flicker every ~0.6s
+    if math.sin(time_s * 10) > 0.9 and len(snake.body) > 1:
+        tongue_tip = (cx + dc * CELL,
+                      cy + dr * CELL)
+        pygame.draw.line(surface, (240, 60, 70),
+                         (cx + dc * (CELL // 2),
+                          cy + dr * (CELL // 2)),
+                         tongue_tip, 2)
+        # Fork
+        pygame.draw.line(surface, (240, 60, 70), tongue_tip,
+                         (tongue_tip[0] - dr * 2,
+                          tongue_tip[1] + dc * 2), 2)
 
 
 # --------------------------------------------------------------------------- #
-# Maze definitions - one for each original CASE in the BAS Level subroutine   #
+# Level data (identical to BAS original)                                      #
 # --------------------------------------------------------------------------- #
 
 
 def build_walls(grid: List[List[str]], level: int) -> None:
-    """Lay out walls for the given level number (1-based)."""
-    # Outer arena border (rows 3 & 50, cols 1 & 80) is shared by every level.
     for c in range(1, GRID_COLS + 1):
         grid[3][c] = WALL
         grid[50][c] = WALL
@@ -259,7 +702,7 @@ def build_walls(grid: List[List[str]], level: int) -> None:
             if 1 <= i <= GRID_ROWS and 1 <= i + 28 <= GRID_COLS:
                 grid[i][i + 28] = WALL
         return
-    # Level 10 and beyond: the BASIC source's CASE ELSE - alternating zigzag.
+    # 10+: alternating zigzag
     for i in range(4, 50, 2):
         grid[i][10] = WALL
         if i + 1 < 50:
@@ -309,7 +752,7 @@ def load_hiscores() -> List[dict]:
 
 def save_hiscore(name: str, score: int, level: int, players: int) -> List[dict]:
     entries = load_hiscores()
-    entries.append({"name": name[:12] or "PLAYER",
+    entries.append({"name": (name or "PLAYER")[:12],
                     "score": int(score),
                     "level": int(level),
                     "players": int(players)})
@@ -323,7 +766,7 @@ def save_hiscore(name: str, score: int, level: int, players: int) -> List[dict]:
 
 
 # --------------------------------------------------------------------------- #
-# Drawing helpers                                                             #
+# Rendering helpers                                                           #
 # --------------------------------------------------------------------------- #
 
 
@@ -331,82 +774,127 @@ def cell_rect(r: int, c: int) -> pygame.Rect:
     return pygame.Rect((c - 1) * CELL, HUD_H + (r - 1) * CELL, CELL, CELL)
 
 
-def draw_grid_background(surface: pygame.Surface) -> None:
-    surface.fill(BG_COL, pygame.Rect(0, HUD_H, SCREEN_W, SCREEN_H - HUD_H))
-    # Faint grid lines for that pixel-art feel.
-    for x in range(0, SCREEN_W, CELL):
-        pygame.draw.line(surface, GRID_COL, (x, HUD_H), (x, SCREEN_H), 1)
-    for y in range(HUD_H, SCREEN_H, CELL):
-        pygame.draw.line(surface, GRID_COL, (0, y), (SCREEN_W, y), 1)
-
-
-def draw_walls(surface: pygame.Surface, grid: List[List[str]]) -> None:
-    for r in range(1, GRID_ROWS + 1):
-        for c in range(1, GRID_COLS + 1):
-            if grid[r][c] == WALL:
-                rect = cell_rect(r, c)
-                pygame.draw.rect(surface, WALL_COL, rect)
-                pygame.draw.rect(surface, WALL_HI, rect, 1)
-
-
-def draw_snake(surface: pygame.Surface, snake: Snake) -> None:
-    if not snake.body:
-        return
-    n = len(snake.body)
-    for i, (r, c) in enumerate(snake.body):
-        rect = cell_rect(r, c).inflate(-1, -1)
-        is_head = (i == n - 1)
-        col = snake.head_color if is_head else snake.body_color
-        pygame.draw.rect(surface, col, rect, border_radius=3)
-    # Eye dot on the head for personality.
-    hr, hc = snake.head
-    cx = (hc - 1) * CELL + CELL // 2
-    cy = HUD_H + (hr - 1) * CELL + CELL // 2
-    pygame.draw.circle(surface, (20, 20, 20), (cx, cy), max(1, CELL // 5))
-
-
-def draw_number(surface: pygame.Surface, font: pygame.font.Font,
-                pos: Optional[Tuple[int, int]], value: int) -> None:
-    if pos is None:
-        return
-    r, c = pos
+def cell_center(r: int, c: int) -> Tuple[int, int]:
     rect = cell_rect(r, c)
-    pygame.draw.rect(surface, BG_COL, rect)
-    glyph = font.render(str(value), True, NUM_COL)
-    grect = glyph.get_rect(center=rect.center)
-    surface.blit(glyph, grect)
+    return rect.centerx, rect.centery
 
 
-def draw_hud(surface: pygame.Surface, font: pygame.font.Font,
-             num_players: int, level: int, sammy: Snake, jake: Snake) -> None:
+def draw_walls(surface: pygame.Surface, grid: List[List[str]],
+               tile: pygame.Surface) -> None:
+    for r in range(1, GRID_ROWS + 1):
+        row = grid[r]
+        for c in range(1, GRID_COLS + 1):
+            if row[c] == WALL:
+                surface.blit(tile, ((c - 1) * CELL, HUD_H + (r - 1) * CELL))
+
+
+def draw_food(surface: pygame.Surface, sprite: pygame.Surface,
+              pos: Tuple[int, int], time_s: float) -> None:
+    r, c = pos
+    cx, cy = cell_center(r, c)
+    bob = int(math.sin(time_s * 4.0) * 2)
+    scale = 1.0 + 0.05 * math.sin(time_s * 6.0)
+    sz = sprite.get_width()
+    scaled = pygame.transform.smoothscale(
+        sprite, (int(sz * scale), int(sz * scale)))
+    rect = scaled.get_rect(center=(cx, cy + bob))
+    surface.blit(scaled, rect)
+
+
+def draw_heart(surface: pygame.Surface, cx: int, cy: int,
+               size: int = 10, color=HEART_COL) -> None:
+    r = size // 2
+    pygame.draw.circle(surface, color, (cx - r // 2, cy - r // 3), r)
+    pygame.draw.circle(surface, color, (cx + r // 2, cy - r // 3), r)
+    pygame.draw.polygon(surface, color,
+                        [(cx - r, cy), (cx + r, cy),
+                         (cx, cy + r + r // 2)])
+    pygame.draw.circle(surface, HEART_SHINE,
+                       (cx - r // 2 - 1, cy - r // 2), max(1, r // 3))
+
+
+def draw_hud(surface: pygame.Surface, font_med: pygame.font.Font,
+             font_small: pygame.font.Font,
+             num_players: int, level: int,
+             sammy: Snake, jake: Snake,
+             next_food_icon: pygame.Surface,
+             next_value: int) -> None:
     pygame.draw.rect(surface, HUD_BG, pygame.Rect(0, 0, SCREEN_W, HUD_H))
-    pygame.draw.line(surface, GREY, (0, HUD_H - 1), (SCREEN_W, HUD_H - 1), 1)
+    pygame.draw.line(surface, (90, 90, 110),
+                     (0, HUD_H - 1), (SCREEN_W, HUD_H - 1), 1)
 
-    lvl = font.render(f"LEVEL {level}", True, HUD_FG)
-    surface.blit(lvl, lvl.get_rect(center=(SCREEN_W // 2, HUD_H // 2)))
+    # Level + next item
+    lvl_txt = font_med.render(f"LEVEL {level}", True, HUD_FG)
+    surface.blit(lvl_txt, lvl_txt.get_rect(midleft=(SCREEN_W // 2 - 50,
+                                                    HUD_H // 2)))
+    icon_x = SCREEN_W // 2 + 20
+    surface.blit(next_food_icon,
+                 next_food_icon.get_rect(center=(icon_x, HUD_H // 2)))
+    tag = font_small.render(f"x{next_value}", True, HUD_FG)
+    surface.blit(tag, tag.get_rect(midleft=(icon_x + 20, HUD_H // 2)))
 
-    s_txt = font.render(
-        f"SAMMY  Lives {sammy.lives}   {sammy.score:>6}", True, SAMMY_COL)
-    surface.blit(s_txt, s_txt.get_rect(midright=(SCREEN_W - 12, HUD_H // 2)))
-
+    # Sammy (right side)
+    _draw_player_block(surface, font_med, font_small, sammy,
+                       SCREEN_W - 16, HUD_H // 2, align="right",
+                       accent=SAMMY_LIGHT)
+    # Jake (left side, 2-player only)
     if num_players == 2:
-        j_txt = font.render(
-            f"{jake.score:<6}   Lives {jake.lives}  JAKE", True, JAKE_COL)
+        _draw_player_block(surface, font_med, font_small, jake,
+                           16, HUD_H // 2, align="left",
+                           accent=JAKE_LIGHT)
 
-        surface.blit(j_txt, j_txt.get_rect(midleft=(12, HUD_H // 2)))
+
+def _draw_player_block(surface, font_med, font_small, snake: Snake,
+                       x: int, y: int, align: str,
+                       accent: Tuple[int, int, int]) -> None:
+    name_txt = font_med.render(snake.name, True, accent)
+    score_txt = font_med.render(f"{snake.score:>6}", True, HUD_FG)
+    anchor = {"right": "midright", "left": "midleft"}[align]
+    # Score and name
+    if align == "right":
+        s_rect = score_txt.get_rect(**{anchor: (x, y)})
+        surface.blit(score_txt, s_rect)
+        n_rect = name_txt.get_rect(midright=(s_rect.left - 10, y))
+        surface.blit(name_txt, n_rect)
+        # Hearts above
+        for i in range(snake.lives):
+            draw_heart(surface, s_rect.left - 10 - i * 14, y - 15, 8)
+        if snake.combo >= 2:
+            c_txt = font_small.render(f"x{min(snake.combo, 3)} COMBO!",
+                                      True, (255, 220, 80))
+            surface.blit(c_txt, c_txt.get_rect(midright=(s_rect.left - 10,
+                                                        y + 14)))
+    else:
+        n_rect = name_txt.get_rect(**{anchor: (x, y)})
+        surface.blit(name_txt, n_rect)
+        s_rect = score_txt.get_rect(midleft=(n_rect.right + 10, y))
+        surface.blit(score_txt, s_rect)
+        for i in range(snake.lives):
+            draw_heart(surface, s_rect.right + 10 + i * 14, y - 15, 8)
+        if snake.combo >= 2:
+            c_txt = font_small.render(f"x{min(snake.combo, 3)} COMBO!",
+                                      True, (255, 220, 80))
+            surface.blit(c_txt, c_txt.get_rect(midleft=(s_rect.right + 10,
+                                                       y + 14)))
 
 
 def draw_dialog(surface: pygame.Surface, font: pygame.font.Font,
-                lines: List[str]) -> None:
-    width = max(font.size(l)[0] for l in lines) + 60
-    height = font.get_linesize() * len(lines) + 36
+                lines: List[str], y_bias: int = 0) -> None:
+    width = max(font.size(l)[0] for l in lines) + 70
+    height = font.get_linesize() * len(lines) + 40
     rect = pygame.Rect(0, 0, width, height)
-    rect.center = (SCREEN_W // 2, HUD_H + (SCREEN_H - HUD_H) // 2)
-    pygame.draw.rect(surface, DIALOG_BG, rect, border_radius=8)
-    pygame.draw.rect(surface, DIALOG_FG, rect, 2, border_radius=8)
-    y = rect.top + 18
-    for line in lines:
-        surf = font.render(line, True, DIALOG_FG)
+    rect.center = (SCREEN_W // 2,
+                   HUD_H + (SCREEN_H - HUD_H) // 2 + y_bias)
+    shadow = pygame.Surface((rect.w, rect.h), pygame.SRCALPHA)
+    pygame.draw.rect(shadow, (0, 0, 0, 160), shadow.get_rect(),
+                     border_radius=12)
+    surface.blit(shadow, (rect.x + 5, rect.y + 6))
+    pygame.draw.rect(surface, DIALOG_BG, rect, border_radius=12)
+    pygame.draw.rect(surface, DIALOG_BORDER, rect, 2, border_radius=12)
+    y = rect.top + 20
+    for i, line in enumerate(lines):
+        colour = (DIALOG_BORDER if i == 0 else DIALOG_FG)
+        surf = font.render(line, True, colour)
         surface.blit(surf, surf.get_rect(midtop=(rect.centerx, y)))
         y += font.get_linesize()
 
@@ -417,8 +905,9 @@ def draw_dialog(surface: pygame.Surface, font: pygame.font.Font,
 
 
 def wait_space(screen: pygame.Surface, font: pygame.font.Font,
-               draw_world, lines: List[str]) -> bool:
-    """Block until the player hits Space (returns True) or Esc (returns False)."""
+               draw_world: Callable[[], None],
+               lines: List[str]) -> bool:
+    clock = pygame.time.Clock()
     while True:
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
@@ -431,7 +920,7 @@ def wait_space(screen: pygame.Surface, font: pygame.font.Font,
         draw_world()
         draw_dialog(screen, font, lines)
         pygame.display.flip()
-        pygame.time.Clock().tick(FPS)
+        clock.tick(FPS)
 
 
 def text_input(screen: pygame.Surface, font: pygame.font.Font,
@@ -451,32 +940,46 @@ def text_input(screen: pygame.Surface, font: pygame.font.Font,
                     return default
                 elif len(text) < 12 and ev.unicode and ev.unicode.isprintable():
                     text += ev.unicode
-        screen.fill(BG_COL)
+        screen.fill(BG_DEEP)
         draw_dialog(screen, font, [prompt, "", text + "_",
                                    "", "(Enter to confirm)"])
         pygame.display.flip()
         clock.tick(FPS)
 
 
+def fade_out(screen: pygame.Surface, duration_ms: int = 250) -> None:
+    overlay = pygame.Surface((SCREEN_W, SCREEN_H))
+    overlay.fill((0, 0, 0))
+    clock = pygame.time.Clock()
+    steps = max(1, duration_ms // 16)
+    for i in range(steps + 1):
+        alpha = int(255 * i / steps)
+        overlay.set_alpha(alpha)
+        screen.blit(overlay, (0, 0))
+        pygame.display.flip()
+        clock.tick(FPS)
+
+
 # --------------------------------------------------------------------------- #
-# Menu screens                                                                #
+# Intro / menu                                                                #
 # --------------------------------------------------------------------------- #
 
 
-def intro_screen(screen: pygame.Surface,
-                 fonts: dict) -> Optional[Tuple[int, int, bool]]:
-    """Return (num_players, skill, accelerate) or None to quit."""
+def intro_screen(screen: pygame.Surface, fonts: dict,
+                 bg: pygame.Surface, food_sprites: List[pygame.Surface]
+                 ) -> Optional[Tuple[int, int, bool]]:
     options = [
         ("Players", [1, 2], 0),
-        ("Skill (1-100)", list(range(10, 101, 10)), 4),
-        ("Speed up each level", ["No", "Yes"], 0),
+        ("Skill", list(range(10, 101, 10)), 6),
+        ("Accelerate each level", ["No", "Yes"], 1),
     ]
     selected = 0
     clock = pygame.time.Clock()
     big = fonts["big"]
     med = fonts["med"]
     small = fonts["small"]
-    title_phase = 0.0
+    t = 0.0
+    play_menu_chord()
 
     while True:
         for ev in pygame.event.get():
@@ -492,102 +995,143 @@ def intro_screen(screen: pygame.Surface,
                     selected = (selected - 1) % len(options)
                     play_blip()
                 elif ev.key in (pygame.K_LEFT, pygame.K_a):
-                    label, choices, idx = options[selected]
-                    options[selected] = (label, choices, (idx - 1) % len(choices))
+                    lbl, choices, idx = options[selected]
+                    options[selected] = (lbl, choices, (idx - 1) % len(choices))
                     play_blip()
                 elif ev.key in (pygame.K_RIGHT, pygame.K_d):
-                    label, choices, idx = options[selected]
-                    options[selected] = (label, choices, (idx + 1) % len(choices))
+                    lbl, choices, idx = options[selected]
+                    options[selected] = (lbl, choices, (idx + 1) % len(choices))
                     play_blip()
                 elif ev.key in (pygame.K_RETURN, pygame.K_SPACE):
-                    n = options[0][1][options[0][2]]
-                    sk = options[1][1][options[1][2]]
-                    acc = options[2][2] == 1
-                    return n, sk, acc
+                    return (options[0][1][options[0][2]],
+                            options[1][1][options[1][2]],
+                            options[2][2] == 1)
 
-        screen.fill(BG_COL)
-        title_phase += 0.05
+        screen.blit(bg, (0, HUD_H))
+        pygame.draw.rect(screen, HUD_BG, pygame.Rect(0, 0, SCREEN_W, HUD_H))
+
+        t += 1 / FPS
+        # Decorative floating foods
+        for i, sprite in enumerate(food_sprites):
+            fx = 60 + i * (SCREEN_W - 120) / (len(food_sprites) - 1)
+            fy = SCREEN_H - 110 + math.sin(t * 2 + i) * 10
+            scaled = pygame.transform.rotozoom(sprite, math.sin(t + i) * 10, 1.0)
+            screen.blit(scaled, scaled.get_rect(center=(fx, fy)))
+
         title = big.render("N I B B L E S", True,
-                           (200 + int(50 * math.sin(title_phase)),
-                            200 + int(50 * math.sin(title_phase + 1)),
-                            120))
-        screen.blit(title, title.get_rect(center=(SCREEN_W // 2, 90)))
-        sub = med.render("Python edition - based on QBasic NIBBLES.BAS (1990)",
-                         True, GREY)
-        screen.blit(sub, sub.get_rect(center=(SCREEN_W // 2, 140)))
+                           (210 + int(40 * math.sin(t * 2)),
+                            210 + int(40 * math.sin(t * 2 + 1)),
+                            160))
+        screen.blit(title, title.get_rect(center=(SCREEN_W // 2, 120)))
 
-        # Options
-        base_y = 230
+        sub = med.render("Enhanced Edition - based on QBasic NIBBLES.BAS (1990)",
+                         True, GREY)
+        screen.blit(sub, sub.get_rect(center=(SCREEN_W // 2, 170)))
+
+        base_y = 260
         for i, (label, choices, idx) in enumerate(options):
-            y = base_y + i * 50
-            colour = WHITE if i == selected else GREY
-            arrow = ">" if i == selected else " "
-            txt = med.render(f"{arrow} {label}: < {choices[idx]} >",
+            y = base_y + i * 54
+            is_sel = i == selected
+            colour = WHITE if is_sel else GREY
+            caret = ">" if is_sel else " "
+            txt = med.render(f"{caret}  {label}:  < {choices[idx]} >",
                              True, colour)
             screen.blit(txt, txt.get_rect(center=(SCREEN_W // 2, y)))
 
-        # Controls help
-        help_lines = [
+        hint_lines = [
             "Player 1: Arrow keys     Player 2: W A S D",
             "Pause: P or Space        Quit: Esc",
-            "",
-            "Up/Down to choose row, Left/Right to change, Enter to start",
+            "Up/Down to pick row, Left/Right to change, Enter to start",
         ]
-        for j, line in enumerate(help_lines):
-            t = small.render(line, True, DIM)
-            screen.blit(t, t.get_rect(center=(SCREEN_W // 2, 430 + j * 22)))
+        for j, line in enumerate(hint_lines):
+            surf = small.render(line, True, DIM)
+            screen.blit(surf, surf.get_rect(center=(SCREEN_W // 2,
+                                                   460 + j * 22)))
 
-        # Hi-scores
         scores = load_hiscores()[:5]
         if scores:
-            t = small.render("- High scores -", True, NUM_COL)
-            screen.blit(t, t.get_rect(center=(SCREEN_W // 2, 540)))
+            t_head = small.render("- High scores -", True, NUM_COL)
+            screen.blit(t_head, t_head.get_rect(center=(SCREEN_W // 2, 560)))
             for k, e in enumerate(scores):
-                line = f"{k+1}. {e['name']:<12} {e['score']:>6}  L{e['level']:<2}  {e['players']}P"
+                line = (f"{k+1}. {e['name']:<12} {e['score']:>6}"
+                        f"  L{e['level']:<2}  {e['players']}P")
                 ts = small.render(line, True, WHITE)
-                screen.blit(ts, ts.get_rect(center=(SCREEN_W // 2, 560 + k * 18)))
+                screen.blit(ts, ts.get_rect(center=(SCREEN_W // 2,
+                                                   582 + k * 20)))
 
         pygame.display.flip()
         clock.tick(FPS)
 
 
 # --------------------------------------------------------------------------- #
-# Core gameplay                                                               #
+# Game loop                                                                   #
 # --------------------------------------------------------------------------- #
 
 
-def random_number_pos(grid: List[List[str]], snakes: List[Snake]
-                      ) -> Optional[Tuple[int, int]]:
-    snake_cells = {pos for s in snakes for pos in s.body}
+def random_number_pos(grid: List[List[str]],
+                      snakes: List[Snake]) -> Optional[Tuple[int, int]]:
+    occ = {pos for s in snakes for pos in s.body}
     for _ in range(2000):
         r = random.randint(4, 49)
         c = random.randint(2, 79)
-        if grid[r][c] == EMPTY and (r, c) not in snake_cells:
+        if grid[r][c] == EMPTY and (r, c) not in occ:
             return (r, c)
     return None
 
 
-def game_loop(screen: pygame.Surface, fonts: dict,
-              num_players: int, skill: int, accelerate: bool) -> None:
+def countdown(screen: pygame.Surface, font: pygame.font.Font,
+              draw_world: Callable[[], None]) -> None:
+    big = pygame.font.SysFont("consolas,monospace", 120, bold=True)
     clock = pygame.time.Clock()
-    big = fonts["big"]
+    for n in ("3", "2", "1", "GO!"):
+        t = 0.0
+        while t < 0.55:
+            dt = clock.tick(FPS) / 1000.0
+            t += dt
+            draw_world()
+            scale = 1.0 + (1.0 - t / 0.55) * 1.5
+            txt = big.render(n, True, (255, 240, 120))
+            txt = pygame.transform.rotozoom(txt, 0, 1 / scale)
+            screen.blit(txt, txt.get_rect(center=(SCREEN_W // 2,
+                                                 HUD_H + (SCREEN_H - HUD_H) // 2)))
+            pygame.display.flip()
+            for ev in pygame.event.get():
+                if ev.type == pygame.QUIT:
+                    return
+                if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+                    return
+
+
+def game_loop(screen: pygame.Surface, fonts: dict,
+              num_players: int, skill: int, accelerate: bool,
+              assets: dict) -> None:
+    clock = pygame.time.Clock()
     med = fonts["med"]
     small = fonts["small"]
 
-    # Move period in milliseconds.  skill 1 -> ~218 ms, 100 -> ~20 ms.
     base_period = max(20, 220 - skill * 2)
     level = 1
 
-    sammy = Snake("SAMMY", SAMMY_COL, SAMMY_HEAD)
-    jake = Snake("JAKE", JAKE_COL, JAKE_HEAD)
+    sammy = Snake("SAMMY", SAMMY_DARK, SAMMY_LIGHT, SAMMY_HEAD)
+    jake = Snake("JAKE", JAKE_DARK, JAKE_LIGHT, JAKE_HEAD)
     snakes = [sammy] if num_players == 1 else [sammy, jake]
 
     grid: List[List[str]] = [[EMPTY] * (GRID_COLS + 2)
                              for _ in range(GRID_ROWS + 2)]
     number_pos: Optional[Tuple[int, int]] = None
     number_value = 1
+    particles = ParticleSystem()
+    shake_t = 0.0
+    flash_t = 0.0
 
-    def reset_level(new_level: bool) -> None:
+    bg = assets["bg"]
+    wall_tile = assets["wall_tile"]
+    food_sprites: List[pygame.Surface] = assets["food"]
+    food_icons = assets["food_icons"]
+
+    period = max(20, base_period - (level - 1) * 8) if accelerate else base_period
+
+    def reset_level() -> None:
         nonlocal grid, number_pos, number_value
         grid = [[EMPTY] * (GRID_COLS + 2) for _ in range(GRID_ROWS + 2)]
         build_walls(grid, level)
@@ -597,29 +1141,105 @@ def game_loop(screen: pygame.Surface, fonts: dict,
         number_pos = None
         number_value = 1
 
-    def draw_world() -> None:
-        draw_grid_background(screen)
-        draw_walls(screen, grid)
-        draw_number(screen, big, number_pos, number_value)
+    def draw_world(now_s: float = 0.0) -> None:
+        # Shake offset
+        ox = oy = 0
+        if shake_t > 0:
+            amp = int(min(8, 60 * shake_t))
+            ox = random.randint(-amp, amp)
+            oy = random.randint(-amp, amp)
+        screen.fill((0, 0, 0))
+        screen.blit(bg, (ox, HUD_H + oy))
+        draw_walls_shifted(screen, grid, wall_tile, ox, oy)
+        if number_pos is not None:
+            draw_food_shifted(screen, food_sprites[number_value - 1],
+                              number_pos, now_s, ox, oy)
         for s in snakes:
-            draw_snake(screen, s)
-        draw_hud(screen, med, num_players, level, sammy, jake)
+            draw_snake_shifted(screen, s, now_s, ox, oy)
+        particles.draw(screen)
+        next_icon = food_icons[number_value - 1]
+        draw_hud(screen, med, small, num_players, level,
+                 sammy, jake, next_icon, number_value)
+        if flash_t > 0:
+            overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+            overlay.fill((255, 255, 255, int(255 * min(1.0, flash_t))))
+            screen.blit(overlay, (0, 0))
 
-    reset_level(new_level=True)
+    def draw_walls_shifted(surf, g, tile, ox, oy):
+        for r in range(1, GRID_ROWS + 1):
+            row = g[r]
+            for c in range(1, GRID_COLS + 1):
+                if row[c] == WALL:
+                    surf.blit(tile, ((c - 1) * CELL + ox,
+                                     HUD_H + (r - 1) * CELL + oy))
 
-    move_accumulator = 0.0
-    period = base_period - (level - 1) * 8 if accelerate else base_period
-    period = max(20, period)
+    def draw_food_shifted(surf, sprite, pos, now_s, ox, oy):
+        r, c = pos
+        rect = cell_rect(r, c).move(ox, oy)
+        cx, cy = rect.centerx, rect.centery
+        bob = int(math.sin(now_s * 4.0) * 2)
+        scale = 1.0 + 0.05 * math.sin(now_s * 6.0)
+        sz = sprite.get_width()
+        scaled = pygame.transform.smoothscale(
+            sprite, (int(sz * scale), int(sz * scale)))
+        surf.blit(scaled, scaled.get_rect(center=(cx, cy + bob)))
 
-    if not wait_space(screen, med, draw_world,
-                      [f"Level {level}", "Press SPACE to begin",
-                       "(Esc to abandon)"]):
+    def draw_snake_shifted(surf, snake, now_s, ox, oy):
+        if not snake.body:
+            return
+        n = len(snake.body)
+        for i, (r, c) in enumerate(snake.body):
+            t = i / max(1, n - 1)
+            col = _lerp(snake.dark, snake.light, 0.3 + 0.7 * t)
+            rect = cell_rect(r, c).move(ox, oy).inflate(-1, -1)
+            pygame.draw.rect(surf, col, rect, border_radius=4)
+        hr, hc = snake.head
+        head_rect = cell_rect(hr, hc).move(ox, oy)
+        pygame.draw.rect(surf, snake.head_col,
+                         head_rect.inflate(1, 1), border_radius=5)
+        pygame.draw.rect(surf, (20, 20, 30),
+                         head_rect.inflate(1, 1), 1, border_radius=5)
+        dr, dc = DIRS[snake.direction]
+        cx, cy = head_rect.centerx, head_rect.centery
+        px, py = -dc, dr
+        eye_off = max(2, CELL // 4)
+        eye_r = max(2, CELL // 5)
+        for sign in (-1, 1):
+            ex = cx + px * sign * eye_off
+            ey = cy + py * sign * eye_off
+            pygame.draw.circle(surf, (240, 240, 250), (ex, ey), eye_r)
+            ps = max(1, eye_r // 2)
+            pygame.draw.circle(surf, (20, 20, 40),
+                               (ex + dc * ps, ey + dr * ps),
+                               max(1, eye_r - 2))
+        if math.sin(now_s * 10) > 0.9 and len(snake.body) > 1:
+            tip = (cx + dc * CELL, cy + dr * CELL)
+            pygame.draw.line(surf, (240, 60, 70),
+                             (cx + dc * (CELL // 2), cy + dr * (CELL // 2)),
+                             tip, 2)
+
+    reset_level()
+    now_s = 0.0
+
+    if not wait_space(screen, med, lambda: draw_world(now_s),
+                      [f"Level {level}",
+                       "Press SPACE to begin",
+                       "(Esc to quit)"]):
         return
+    countdown(screen, med, lambda: draw_world(now_s))
 
+    move_accum = 0.0
     paused = False
     running = True
     while running:
         dt = clock.tick(FPS)
+        dt_s = dt / 1000.0
+        now_s += dt_s
+        if shake_t > 0:
+            shake_t = max(0.0, shake_t - dt_s)
+        if flash_t > 0:
+            flash_t = max(0.0, flash_t - dt_s * 2)
+
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
                 return
@@ -628,7 +1248,6 @@ def game_loop(screen: pygame.Surface, fonts: dict,
                     return
                 if ev.key in (pygame.K_p, pygame.K_SPACE):
                     paused = True
-                # Player 1 (arrow keys) - this is "Sammy" in the original.
                 elif ev.key == pygame.K_UP and sammy.direction != 2:
                     sammy.pending = 1
                 elif ev.key == pygame.K_DOWN and sammy.direction != 1:
@@ -637,7 +1256,6 @@ def game_loop(screen: pygame.Surface, fonts: dict,
                     sammy.pending = 3
                 elif ev.key == pygame.K_RIGHT and sammy.direction != 3:
                     sammy.pending = 4
-                # Player 2 (WASD) -> Jake.
                 elif num_players == 2:
                     if ev.key == pygame.K_w and jake.direction != 2:
                         jake.pending = 1
@@ -649,118 +1267,142 @@ def game_loop(screen: pygame.Surface, fonts: dict,
                         jake.pending = 4
 
         if paused:
-            if not wait_space(screen, med, draw_world,
+            if not wait_space(screen, med, lambda: draw_world(now_s),
                               ["P A U S E D", "Press SPACE to resume",
                                "(Esc to quit)"]):
                 return
             paused = False
             continue
 
-        # Lay down a number if the field has none.
         if number_pos is None:
             number_pos = random_number_pos(grid, snakes)
-            number_value = 1 if number_value > 9 else number_value
-            if number_pos is None:
-                # Field is full of stuff; treat as level cleared.
-                number_value = 10
 
-        # Fixed-timestep snake movement.
-        move_accumulator += dt
-        moved = False
-        while move_accumulator >= period:
-            move_accumulator -= period
-            moved = True
+        # Combo countdown
+        for s in snakes:
+            if s.combo > 0:
+                s.combo_timer -= dt_s
+                if s.combo_timer <= 0:
+                    s.combo = 0
 
+        particles.update(dt_s)
+
+        move_accum += dt
+        while move_accum >= period:
+            move_accum -= period
+
+            # Commit direction choices
             for s in snakes:
                 s.direction = s.pending
 
+            # Compute new heads
             new_heads: List[Tuple[Snake, Tuple[int, int]]] = []
             for s in snakes:
                 dr, dc = DIRS[s.direction]
                 hr, hc = s.head
                 new_heads.append((s, (hr + dr, hc + dc)))
 
-            # Eat numbers first so the snake can pass through the spot.
-            ate_count = 0
+            # Resolve eating (snakes can pass through where food was)
+            ate = []
             for s, (nr, nc) in new_heads:
                 if number_pos is not None and (nr, nc) == number_pos:
-                    s.score += number_value
+                    bonus = 1 + 0.1 * min(s.combo, 3)
+                    gained = int(round(number_value * bonus))
+                    s.score += gained
                     if s.target_length < MAX_LEN - 30:
                         s.target_length += number_value * 4
-                    play_eat()
-                    ate_count += 1
+                    s.combo = min(3, s.combo + 1)
+                    s.combo_timer = 2.0
+                    cx, cy = cell_center(nr, nc)
+                    particles.spark(cx, cy, (255, 220, 90))
+                    play_eat(number_value)
+                    ate.append(s)
 
-            if ate_count:
+            if ate:
                 if number_value >= 9:
-                    # Level cleared.
+                    # Big burst
+                    for s in ate:
+                        hr, hc = s.head
+                        cx, cy = cell_center(hr, hc)
+                        particles.burst(cx, cy, (255, 230, 100))
+                    flash_t = 0.6
                     level += 1
                     play_levelup()
-                    reset_level(new_level=True)
+                    reset_level()
                     if accelerate:
                         period = max(20, base_period - (level - 1) * 8)
-                    if not wait_space(screen, med, draw_world,
-                                      [f"Level {level}",
+                    draw_world(now_s)
+                    pygame.display.flip()
+                    if not wait_space(screen, med, lambda: draw_world(now_s),
+                                      [f"LEVEL {level}",
                                        "Press SPACE to continue"]):
                         return
-                    move_accumulator = 0.0
+                    countdown(screen, med, lambda: draw_world(now_s))
+                    move_accum = 0.0
                     continue
-                else:
-                    number_value += 1
-                    number_pos = None
+                number_value += 1
+                number_pos = None
 
-            # Now resolve collisions for the new heads.
-            died = []
-            heads_dict = {}
+            # Collisions
+            died: List[Snake] = []
+            head_counts: dict = {}
             for s, pos in new_heads:
-                heads_dict.setdefault(pos, []).append(s)
+                head_counts.setdefault(pos, []).append(s)
 
             for s, (nr, nc) in new_heads:
                 if not s.alive:
                     continue
-                # Out-of-grid check.  Walls already cover the perimeter, but be
-                # defensive in case of off-by-one weirdness.
                 if not (1 <= nr <= GRID_ROWS and 1 <= nc <= GRID_COLS):
                     died.append(s)
                     continue
                 if grid[nr][nc] == WALL:
                     died.append(s)
                     continue
-                # Collision with any snake's existing body (excluding tail-cell
-                # that's about to be vacated).
-                hit = False
+                collide = False
                 for other in snakes:
-                    body = other.body
-                    # Tail will move out of the way unless that snake is
-                    # growing this tick (target_length > current length).
                     growing = other.target_length > len(other.body)
-                    occupied = body if growing else body[1:]
+                    occupied = other.body if growing else other.body[1:]
                     if (nr, nc) in occupied:
-                        hit = True
+                        collide = True
                         break
-                if hit:
+                if collide:
                     died.append(s)
                     continue
-                # Two heads slamming into the same square.
-                if len(heads_dict[(nr, nc)]) > 1:
+                if len(head_counts[(nr, nc)]) > 1:
                     died.append(s)
-                    continue
 
-            # Apply movement / death.
             if died:
                 for s in died:
                     s.alive = False
                     s.lives = max(0, s.lives - 1)
                     s.score = max(0, s.score - 10)
+                    s.combo = 0
+                    hr, hc = s.head
+                    cx, cy = cell_center(hr, hc)
+                    particles.burst(cx, cy, s.light)
+                    particles.burst(cx, cy, (255, 240, 100))
+                shake_t = 0.5
                 play_die()
 
+                # Let the particles play for a short moment
+                t0 = 0.0
+                while t0 < 0.6:
+                    dt2 = clock.tick(FPS) / 1000.0
+                    t0 += dt2
+                    now_s += dt2
+                    particles.update(dt2)
+                    if shake_t > 0:
+                        shake_t = max(0.0, shake_t - dt2)
+                    draw_world(now_s)
+                    pygame.display.flip()
+
                 msg = " / ".join(s.name for s in died) + "  CRASHED"
-                if not wait_space(screen, med, draw_world,
+                if not wait_space(screen, med, lambda: draw_world(now_s),
                                   [msg, "Press SPACE to continue"]):
                     return
 
                 if any(s.lives == 0 for s in snakes):
                     _handle_game_over(screen, fonts, num_players,
-                                      level, sammy, jake, skill, accelerate)
+                                      level, sammy, jake)
                     return
 
                 sp1, sp2 = spawn_for(level)
@@ -768,23 +1410,27 @@ def game_loop(screen: pygame.Surface, fonts: dict,
                 jake.reset(*sp2)
                 number_pos = None
                 number_value = 1
-                move_accumulator = 0.0
-                break  # exit the inner accumulator loop
+                move_accum = 0.0
+                break
 
-            # Apply head moves.
+            # Move heads: append + trim
             for s, pos in new_heads:
                 s.body.append(pos)
+                # Trail
+                cx, cy = cell_center(*pos)
+                particles.trail(cx + random.uniform(-2, 2),
+                                cy + random.uniform(-2, 2),
+                                _lerp(s.dark, s.light, 0.8))
                 while len(s.body) > s.target_length:
                     s.body.pop(0)
 
-        draw_world()
+        draw_world(now_s)
         pygame.display.flip()
 
 
 def _handle_game_over(screen: pygame.Surface, fonts: dict,
                       num_players: int, level: int,
-                      sammy: Snake, jake: Snake,
-                      skill: int, accelerate: bool) -> None:
+                      sammy: Snake, jake: Snake) -> None:
     med = fonts["med"]
 
     if num_players == 1:
@@ -796,14 +1442,17 @@ def _handle_game_over(screen: pygame.Surface, fonts: dict,
 
     lines = ["G A M E   O V E R", ""]
     if num_players == 1:
-        lines.append(f"Final score: {sammy.score}    Level reached: {level}")
+        lines.append(f"Final score: {sammy.score}")
+        lines.append(f"Level reached: {level}")
     else:
         lines.append(f"Sammy: {sammy.score}    Jake: {jake.score}")
         lines.append(f"Winner: {winner_name}")
     lines.append("")
     lines.append("Press SPACE to record your score, Esc to skip")
 
-    screen.fill(BG_COL)
+    overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+    overlay.fill((0, 0, 0, 160))
+    screen.blit(overlay, (0, 0))
     draw_dialog(screen, med, lines)
     pygame.display.flip()
 
@@ -837,22 +1486,33 @@ def _handle_game_over(screen: pygame.Surface, fonts: dict,
 def main() -> int:
     pygame.init()
     _init_audio()
-    pygame.display.set_caption("Nibbles!")
+    pygame.display.set_caption("Nibbles - Enhanced Edition")
     screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
 
     fonts = {
-        "big": pygame.font.SysFont("consolas,menlo,monospace", 48, bold=True),
+        "big": pygame.font.SysFont("consolas,menlo,monospace", 56, bold=True),
         "med": pygame.font.SysFont("consolas,menlo,monospace", 22, bold=True),
         "small": pygame.font.SysFont("consolas,menlo,monospace", 18),
     }
 
+    bg = build_background()
+    wall_tile = build_wall_tile()
+    food_sprites = build_food_sprites()
+    food_icons = [build_food_icon(sp, 28) for sp in food_sprites]
+    assets = {
+        "bg": bg,
+        "wall_tile": wall_tile,
+        "food": food_sprites,
+        "food_icons": food_icons,
+    }
+
     try:
         while True:
-            choice = intro_screen(screen, fonts)
+            choice = intro_screen(screen, fonts, bg, food_icons)
             if choice is None:
                 return 0
             num_players, skill, accelerate = choice
-            game_loop(screen, fonts, num_players, skill, accelerate)
+            game_loop(screen, fonts, num_players, skill, accelerate, assets)
     finally:
         pygame.quit()
 
